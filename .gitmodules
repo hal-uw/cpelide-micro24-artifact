@@ -2,5 +2,5 @@
 	path = gem5_multigpu
 	url = https://github.com/hal-uw/gem5-multiChiplet-micro24.git
 [submodule "multigpu_benchmarks"]
-	path = multigpu_benchmarks
+	path = gem5_multigpu/multigpu_benchmarks
 	url = https://github.com/hal-uw/gem5-bmks-micro24.git

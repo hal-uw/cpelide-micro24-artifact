@@ -1,0 +1,19 @@
+file /nobackup2/sinclair/rajesh/remote_gem5/util/m5/SConstruct,line 117:
+	Configure(confdir = build/.scons_config)
+scons: Configure: Checking for java package org.junit...
+build/.scons_config/conftest_0.java <-
+  |import org.junit.*;
+javac build/.scons_config/conftest_0.java
+build/.scons_config/conftest_0.java:1: error: package org.junit does not exist
+import org.junit.*;
+^
+1 error
+scons: Configure: no
+
+scons: Configure: Checking whether pkg-config program exists...
+scons: Configure: /bin/pkg-config
+
+scons: Configure: Checking for pkg-config package lua51...
+scons: Configure: (cached) no
+
+

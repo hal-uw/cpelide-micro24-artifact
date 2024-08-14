@@ -1,0 +1,1420 @@
+/*
+ * Copyright (c) 2010-2015 Advanced Micro Devices, Inc.
+ * All rights reserved.
+ *
+ * For use for simulation and test purposes only
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Author: Blake Hechtman
+ */
+//327081638000
+//151006
+machine(MachineType:TCC, "TCC Cache")
+ : CacheMemory * L2cache;
+   VIPERCoalescer * coalescer;
+   bool WB; /*is this cache Writeback?*/
+   int num_gpus := 4;
+   Cycles l2_request_latency := 50;
+   Cycles inter_chiplet_request_latency := 25;
+   Cycles l2_response_latency := 20;
+   bool invalidate_TCC := "true" ;
+
+  // From the TCPs or SQCs
+  MessageBuffer * requestFromTCP, network="From", virtual_network="1", vnet_type="request";
+  // To the Cores. TCC deals only with TCPs/SQCs.
+  MessageBuffer * responseToCore, network="To", virtual_network="3", vnet_type="response";
+  // From the NB
+  MessageBuffer * probeFromNB, network="From", virtual_network="0", vnet_type="request";
+  MessageBuffer * responseFromNB, network="From", virtual_network="2", vnet_type="response";
+  // To the NB
+  MessageBuffer * requestToNB, network="To", virtual_network="0", vnet_type="request";
+  MessageBuffer * responseToNB, network="To", virtual_network="2", vnet_type="response";
+  MessageBuffer * unblockToNB, network="To", virtual_network="4", vnet_type="unblock";
+  MessageBuffer * requestFromTCC, network="To", virtual_network="5", vnet_type="request";
+  MessageBuffer * responseToTCC, network="From", virtual_network="6", vnet_type="response";
+  MessageBuffer * requestToTCC, network="From", virtual_network="5", vnet_type="request";
+  MessageBuffer * responseFromTCC, network="To", virtual_network="6", vnet_type="response";
+
+  MessageBuffer * triggerQueue;
+  MessageBuffer * mandatoryQueue;
+
+{
+  // EVENTS
+  enumeration(Event, desc="TCC Events") {
+    // Requests coming from the Cores
+    RdBlk,                  desc="RdBlk event";
+    RdBlkRemote,            desc="RdBlk event for a remote line";
+    RdBlkFull,             desc="RdBlk to a completely Modified line";
+    RdBlkRemoteFull,        desc="Remote read of a fully Modified line";
+    WrVicBlk,               desc="L1 Write Through";
+    WrVicBlkRemote,         desc="Write Through Remote";
+    WrVicBlkBack,           desc="L1 Write Through(dirty cache)";
+    Atomic,                 desc="Atomic Op";
+    AtomicRemote,           desc="Remote Atomic Op";
+    AtomicDone,             desc="AtomicOps Complete";
+    AtomicDoneRemote,       desc="Atomic Ops Remote Complete";
+    AtomicNotDone,          desc="AtomicOps not Complete";
+    Data,                   desc="data message";
+    DataRemote,             desc="data From Remote L2";
+    DataForRemote,          desc="Data Message to be forwarded to remoteL2";
+    AtomicData,             desc="data for atmomic";
+    AtomicDataRemote,       desc="Data for Remote Atomic";
+
+    Flush,                  desc="Flush request from L1";
+    // Coming from this TCC
+    InvCache,               desc="Invalidation request from L1";
+    L2_Repl,                desc="L2 Replacement";
+    L2Flush,                desc="Flush all addresses in L2";
+    // Probes
+    PrbInv,                 desc="Invalidating probe";
+    // Coming from Memory Controller
+    WBAck,                  desc="writethrough ack from memory";
+    WBRemote,               desc="writethrough ack from remote TCC";
+    WBAckRemote,            desc="Ack for Remote WB";
+    WBAckFromRemote,        desc="Ack forwarded from remote TCC";
+  }
+
+  // STATES
+  state_declaration(State, desc="TCC State", default="TCC_State_I") {
+    M, AccessPermission:Read_Write, desc="Modified(dirty cache only)";
+    W, AccessPermission:Read_Write, desc="Written(dirty cache only)";
+    V, AccessPermission:Read_Only,  desc="Valid";
+    I, AccessPermission:Invalid,    desc="Invalid";
+    IV, AccessPermission:Busy,      desc="Waiting for Data";
+    WI, AccessPermission:Busy,      desc="Waiting on Writethrough Ack";
+    WV, AccessPermission:Busy,      desc="Waiting on WriteBack Ack";
+    A, AccessPermission:Busy,       desc="Invalid waiting on atomici Data";
+  }
+
+  enumeration(RequestType, desc="To communicate stats from transitions to recordStats") {
+    DataArrayRead,    desc="Read the data array";
+    DataArrayWrite,   desc="Write the data array";
+    TagArrayRead,     desc="Read the data array";
+    TagArrayWrite,    desc="Write the data array";
+  }
+
+  // STRUCTURES
+
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,           desc="cache state";
+    bool Dirty,                 desc="Is the data dirty (diff from memory?)";
+    DataBlock DataBlk,          desc="Data for the block";
+    WriteMask writeMask,        desc="Dirty byte mask";
+    MachineID homeNode,         desc="homeNode";
+  }
+
+  structure(TBE, desc="...") {
+    State TBEState,     desc="Transient state";
+    DataBlock DataBlk,  desc="data for the block";
+    bool Dirty,         desc="Is the data dirty?";
+    bool Shared,        desc="Victim hit by shared probe";
+    MachineID From,     desc="Waiting for writeback from...";
+    NetDest Destination, desc="Data destination";
+    int numAtomics,     desc="number remaining atomics";
+    int atomicDoneCnt,  desc="number AtomicDones triggered";
+    bool pendingRead,   default="false", desc="is this a pending Read";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<TCC_TBE>", constructor="m_number_of_TBEs";
+
+  void set_cache_entry(AbstractCacheEntry b);
+  void unset_cache_entry();
+  void set_tbe(TBE b);
+  void unset_tbe();
+  void wakeUpAllBuffers();
+  void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+  MachineID MachineTypeAndNodeIDToMachineID(MachineType mtype, int homeNode);
+
+  // FUNCTION DEFINITIONS
+  Tick clockEdge();
+
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(Entry, "pointer", L2cache.lookup(addr));
+  }
+
+  DataBlock getDataBlock(Addr addr), return_by_ref="yes" {
+    return getCacheEntry(addr).DataBlk;
+  }
+
+  bool presentOrAvail(Addr addr) {
+    return L2cache.isTagPresent(addr) || L2cache.cacheAvail(addr);
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+        tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+        cache_entry.CacheState := state;
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes +
+        functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      return TCC_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      return TCC_State_to_permission(cache_entry.CacheState);
+    }
+
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(TCC_State_to_permission(state));
+    }
+  }
+
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    }
+  }
+
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else {
+      error("Invalid RequestType type in checkResourceAvailable");
+      return true;
+    }
+  }
+
+  void InvalidateBlock(AbstractCacheEntry* abstract_entry, Addr addr){
+    Entry cache_entry := static_cast(Entry, "pointer", abstract_entry);
+    if(is_valid(cache_entry)){
+      if(cache_entry.CacheState == State:V){
+        cache_entry.CacheState := State:I;
+        L2cache.deallocate(addr);
+       DPRINTF(RubySlicc, "Invalidating entry for address %x\n", addr);
+        //unset_cache_entry();
+      }
+      else if(cache_entry.CacheState == State:M){
+        cache_entry.CacheState := State:W;
+      }
+      else if( cache_entry.CacheState == State:W || cache_entry.CacheState == State:I){
+        //no op
+      }
+      else{
+        error("Invalidating block in Transition state\n");
+      }
+    }
+  }
+
+
+  // ** OUT_PORTS **
+
+  // Three classes of ports
+  // Class 1: downward facing network links to NB
+  out_port(requestToNB_out, CPURequestMsg, requestToNB);
+  out_port(responseToNB_out, ResponseMsg, responseToNB);
+  out_port(unblockToNB_out, UnblockMsg, unblockToNB);
+
+  // Class 2: upward facing ports to GPU cores
+  out_port(responseToCore_out, ResponseMsg, responseToCore);
+
+  out_port(triggerQueue_out, TriggerMsg, triggerQueue);
+  //
+  // Class 3: sideward facing ports to Remote GPUs
+  out_port(requestFromTCC_out, CPURequestMsg, requestFromTCC);
+  out_port(responseFromTCC_out, ResponseMsg, responseFromTCC);
+  // request queue going to NB
+  //
+
+
+// ** IN_PORTS **
+  in_port(triggerQueue_in, TriggerMsg, triggerQueue) {
+    if (triggerQueue_in.isReady(clockEdge())) {
+      peek(triggerQueue_in, TriggerMsg) {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+
+        // There is a possible race where multiple AtomicDone triggers can be
+        // sent if another Atomic to the same address is issued after the
+        // AtomicDone is triggered but before the message arrives here. For
+        // that case we count the number of AtomicDones in flight for this
+        // address and only call AtomicDone to deallocate the TBE when it is
+        // the last in flight message.
+        if (tbe.numAtomics == 0 && tbe.atomicDoneCnt == 1) {
+            trigger(Event:AtomicDone, in_msg.addr, cache_entry, tbe);
+        } else {
+            trigger(Event:AtomicNotDone, in_msg.addr, cache_entry, tbe);
+        }
+      }
+    }
+  }
+
+
+
+  in_port(responseFromNB_in, ResponseMsg, responseFromNB) {
+    if (responseFromNB_in.isReady(clockEdge())) {
+      peek(responseFromNB_in, ResponseMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        if (in_msg.Type == CoherenceResponseType:NBSysResp) {
+          if(in_msg.TCCRequestor != machineID){
+              DPRINTF(CPCoh,"Got remote data back from directory for address 0x%lx\n", in_msg.addr );
+              trigger(Event:DataForRemote, in_msg.addr, cache_entry, tbe);
+            }
+          else if(in_msg.Atomic == true){
+            trigger(Event:AtomicData, in_msg.addr, cache_entry, tbe);
+          }  
+         else{   
+          if(presentOrAvail(in_msg.addr)) {
+            trigger(Event:Data, in_msg.addr, cache_entry, tbe);
+            }
+           else {
+            Addr victim :=  L2cache.cacheProbe(in_msg.addr);
+            trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+            }
+          } 
+       } else if (in_msg.Type == CoherenceResponseType:NBSysWBAck) {
+          if(in_msg.WTRequestor != machineID){
+            DPRINTF(CPCoh,"Got Remote write back ack for address0x%lx\n", in_msg.addr );
+            trigger(Event:WBAckRemote, in_msg.addr, cache_entry, tbe);
+          }
+          else{
+          trigger(Event:WBAck, in_msg.addr, cache_entry, tbe);
+          }
+        } else {
+          error("Unexpected Response Message to Core");
+        }
+      }
+    }
+  }
+
+  // Finally handling incoming requests (from TCP) and probes (from NB).
+  in_port(probeNetwork_in, NBProbeRequestMsg, probeFromNB) {
+    if (probeNetwork_in.isReady(clockEdge())) {
+      peek(probeNetwork_in, NBProbeRequestMsg) {
+        DPRINTF(RubySlicc, "%s\n", in_msg);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        trigger(Event:PrbInv, in_msg.addr, cache_entry, tbe);
+      }
+    }
+  }
+
+  in_port(coreRequestNetwork_in, CPURequestMsg, requestFromTCP, rank=0) {
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        //DPRINTF(CPCoh, "%s\n", in_msg);
+        if (in_msg.Type == CoherenceRequestType:WriteThrough) {
+            if(WB) {
+                if(presentOrAvail(in_msg.addr)) {
+                    trigger(Event:WrVicBlkBack, in_msg.addr, cache_entry, tbe);
+                } else {
+                    Addr victim :=  L2cache.cacheProbe(in_msg.addr);
+                    trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+                }
+            } else {
+                trigger(Event:WrVicBlk, in_msg.addr, cache_entry, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:Atomic) {
+          trigger(Event:Atomic, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:RdBlk) {
+          if(is_valid(cache_entry)){
+            if((cache_entry.CacheState == State:W) && cache_entry.writeMask.isFull()) {
+                trigger(Event:RdBlkFull, in_msg.addr, cache_entry, tbe);
+            }
+            else{
+              trigger(Event:RdBlk, in_msg.addr, cache_entry, tbe);
+            }
+          }  
+          else{
+              trigger(Event:RdBlk, in_msg.addr, cache_entry, tbe);
+          } 
+        } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
+          trigger(Event:Flush, in_msg.addr, cache_entry, tbe);
+        }
+        else if (in_msg.Type == CoherenceRequestType:InvCache) {
+          DPRINTF(RubySlicc, "Got the Invalidation at the TCC\n");
+          if(coalescer.isWbComplete()){
+            trigger(Event:InvCache, in_msg.addr, cache_entry, tbe);
+          }
+        }  else {
+          DPRINTF(RubySlicc, "%s\n", in_msg);
+          error("Unexpected Response Message to Core");
+        }
+      }
+    }
+  }
+
+  in_port(mandatoryQueue_in, RubyRequest, mandatoryQueue, desc="...") {
+    if (mandatoryQueue_in.isReady(clockEdge())) {
+      peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
+        Entry cache_entry := getCacheEntry(in_msg.LineAddress);
+        TBE tbe := TBEs.lookup(in_msg.LineAddress);
+        DPRINTF(RubySlicc, "%s\n", in_msg);
+        if (in_msg.Type == RubyRequestType:FLUSH) {
+          trigger(Event:L2Flush, in_msg.LineAddress, cache_entry, tbe);
+        }
+      }
+    }
+  }
+
+  in_port(responseToTCC_in, ResponseMsg, responseToTCC) {
+    if (responseToTCC_in.isReady(clockEdge())) {
+      peek(responseToTCC_in, ResponseMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        if (in_msg.Type == CoherenceResponseType:TDSysResp) {
+          if(in_msg.Atomic == true){
+            trigger(Event:AtomicDataRemote, in_msg.addr, cache_entry, tbe);
+          }
+          else{
+          if(presentOrAvail(in_msg.addr)) {
+            DPRINTF(CPCoh,"Got data back for address 0x%lx\n", in_msg.addr );
+            trigger(Event:DataRemote, in_msg.addr, cache_entry, tbe);
+          } 
+          else {
+            Addr victim :=  L2cache.cacheProbe(in_msg.addr);
+            trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+          }
+          }
+        }
+        else if (in_msg.Type == CoherenceResponseType:TDSysWBAck) {
+          DPRINTF(CPCoh,"my Remote write back ack for address0x%lx\n", in_msg.addr );
+          trigger(Event:WBAckFromRemote, in_msg.addr, cache_entry, tbe);
+      }
+    }
+  }
+  }
+
+   in_port(requestToTCC_in, CPURequestMsg, requestToTCC) {
+    if (requestToTCC_in.isReady(clockEdge())) {
+      peek(requestToTCC_in, CPURequestMsg) {
+      TBE tbe := TBEs.lookup(in_msg.addr);
+      Entry cache_entry := getCacheEntry(in_msg.addr);
+      if (in_msg.Type == CoherenceRequestType:RdBlk) {
+          DPRINTF(CPCoh,"Got a remote read request for address 0x%lx\n", in_msg.addr );
+         if(is_valid(cache_entry)){
+            if((cache_entry.CacheState == State:W) && cache_entry.writeMask.isFull()) {
+                trigger(Event:RdBlkRemoteFull, in_msg.addr, cache_entry, tbe);
+            }
+            else{
+               trigger(Event:RdBlkRemote, in_msg.addr, cache_entry, tbe);
+            }
+         }
+            else{
+              trigger(Event:RdBlkRemote, in_msg.addr, cache_entry, tbe);
+            }
+      }else if (in_msg.Type == CoherenceRequestType:WriteThrough) {
+          DPRINTF(CPCoh,"Got a remote write request for address 0x%lx\n", in_msg.addr );
+          trigger(Event:WBRemote, in_msg.addr, cache_entry, tbe);
+        }
+        else if (in_msg.Type == CoherenceRequestType:Atomic) {
+          trigger(Event:AtomicRemote, in_msg.addr, cache_entry, tbe);
+        }  
+      }
+    } 
+  }
+  // BEGIN ACTIONS
+
+  action(i_invL2, "i", desc="invalidate TCC cache block") {
+    if (is_valid(cache_entry)) {
+        L2cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(sd_sendData, "sd", desc="send Shared response") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysResp;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty := false;
+        out_msg.State := CoherenceState:Shared;
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+   action(sd_sendDataRemote, "sdrr", desc="send Shared response to remote TCC") {
+    peek(requestToTCC_in, CPURequestMsg) {
+      enqueue(responseFromTCC_out, ResponseMsg, inter_chiplet_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysResp;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty := false;
+        out_msg.State := CoherenceState:Shared;
+         DPRINTF(CPCoh,"Sending data from one TCC to another for address 0x%lx\n", address );
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+   action(sdr_sendDataResponseRemote, "sdrrr", desc="send Shared response") {
+  /*
+    if(is_valid(tbe) && tbe.WriteThroughReq == true){
+      DPRINTF(CPCoh, "We are just getting a clean copy no need to send this back to the core \n");
+    }
+    else{
+  */  
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:TDSysResp;
+      out_msg.Sender := machineID;
+      out_msg.Destination := tbe.Destination;
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Dirty := false;
+      DPRINTF(CPCoh,"Sending data back to core for remote request with address 0x%lx\n", address );
+      out_msg.State := CoherenceState:Shared;
+      DPRINTF(RubySlicc, "%s\n", out_msg);
+    }
+ // }
+  }
+
+  action(sdr_sendDataResponse, "sdr", desc="send Shared response") {
+    DPRINTF(CPCoh, "Inside sdr_sendDataReponse for address 0x%lx\n", address );
+    peek(responseFromNB_in, ResponseMsg) {
+      if(in_msg.TCCRequestor != machineID){
+      enqueue(responseFromTCC_out, ResponseMsg, inter_chiplet_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysResp;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.TCCRequestor);
+        out_msg.WTRequestor := in_msg.WTRequestor;
+        out_msg.Atomic := in_msg.Atomic;
+          out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty := false;
+        out_msg.State := CoherenceState:Shared;
+        DPRINTF(CPCoh,"Sending data back to TCC for remote request with address 0x%lx\n", address );
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+   else{
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:TDSysResp;
+      out_msg.Sender := machineID;
+      out_msg.Destination := tbe.Destination;
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Dirty := false;
+      out_msg.State := CoherenceState:Shared;
+      DPRINTF(RubySlicc, "%s\n", out_msg);
+    }
+    }
+    if(in_msg.Atomic == false){
+    enqueue(unblockToNB_out, UnblockMsg, 1) {
+      out_msg.addr := address;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.MessageSize := MessageSizeType:Unblock_Control;
+       DPRINTF(CPCoh,"unblocking directory 0x%lx\n", address );
+      DPRINTF(RubySlicc, "%s\n", out_msg);
+    }
+    }
+    }
+  }
+
+  action(rd_requestDataRemote, "rr", desc="Miss in L2, pass on") {
+        peek(requestToTCC_in, CPURequestMsg) {
+        enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+          out_msg.addr := address;
+          out_msg.Type := in_msg.Type;
+          out_msg.Requestor := machineID;
+          out_msg.TCCRequestor := in_msg.Requestor;
+          out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+          out_msg.Shared := false; // unneeded for this request
+          out_msg.MessageSize := in_msg.MessageSize;
+          DPRINTF(CPCoh," Remote Sending a request to directory for address 0x%lx with homeNode %d and machID %d\n", address, in_msg.homeNode, machineID );
+          DPRINTF(RubySlicc, "%s\n", out_msg);
+        }
+      }
+      }
+
+
+action(rd_requestData, "r", desc="Miss in L2, pass on") {
+    if(tbe.Destination.count()==1){
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        if(isHomeNode(machineID, in_msg.homeNode, num_gpus)){
+        enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+          out_msg.addr := address;
+          out_msg.Type := in_msg.Type;
+          out_msg.Requestor := machineID;
+          out_msg.TCCRequestor := machineID;
+          out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+          out_msg.Shared := false; // unneeded for this request
+          out_msg.MessageSize := in_msg.MessageSize;
+          DPRINTF(CPCoh,"Sending a request to directory for address 0x%lx with homeNode %d and machID %d\n", address, in_msg.homeNode, machineID );
+          DPRINTF(RubySlicc, "%s\n", out_msg);
+        }
+      }
+      else{
+          enqueue(requestFromTCC_out, CPURequestMsg, inter_chiplet_request_latency) {
+            out_msg.addr := address;
+            out_msg.Type := in_msg.Type;
+            out_msg.Requestor := machineID;
+            out_msg.Destination.add(in_msg.homeNode);
+            out_msg.Shared := false; // unneeded for this request
+            out_msg.MessageSize := in_msg.MessageSize;
+            DPRINTF(CPCoh, "Home node doesn't match for machine %d with %d address is 0x%lx\n ", machineIDToNodeID(machineID), in_msg.homeNode, address);
+            DPRINTF(CPCoh,"Sending a remote read request for address 0x%lx with homeNode %d and machID %d\n", address, in_msg.homeNode, machineID );
+            DPRINTF(RubySlicc, "%s\n", out_msg);
+        }
+        }
+      }
+    }  
+  }
+
+  action(w_sendResponseWBAck, "w", desc="send WB Ack") {
+    if(!(is_valid(tbe) && tbe.pendingRead == true)){
+    peek(responseFromNB_in, ResponseMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.WTRequestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+  }
+
+  action(swb_sendWBAck, "swb", desc="send WB Ack") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(ar_sendAtomicResponse, "ar", desc="send Atomic Ack") {
+    peek(responseFromNB_in, ResponseMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:TDSysResp;
+          out_msg.Destination.add(in_msg.WTRequestor);
+          DPRINTF(CPCoh,"Sending data back to core for atomic with address 0x%lx\n", address );
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := in_msg.MessageSize;
+          out_msg.DataBlk := in_msg.DataBlk;
+        }
+    }
+  }
+
+  action(ar_sendAtomicResponseRemote, "arr", desc="send Atomic Ack") {
+    peek(responseToTCC_in, ResponseMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:TDSysResp;
+          out_msg.Destination.add(in_msg.WTRequestor);
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := in_msg.MessageSize;
+           DPRINTF(CPCoh,"Sending data back to core for remote atomic with address 0x%lx\n", address );
+          out_msg.DataBlk := in_msg.DataBlk;
+        }
+    }
+  }
+
+  action(a_allocateBlock, "a", desc="allocate TCC block") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L2cache.allocate(address, new Entry));
+      cache_entry.homeNode := machineID;
+      cache_entry.writeMask.clear();
+    }
+  }
+
+  action(p_profileMiss, "pm", desc="Profile cache miss") {
+      L2cache.profileDemandMiss();
+  }
+
+  action(p_profileHit, "ph", desc="Profile cache hit") {
+      L2cache.profileDemandHit();
+  }
+
+  action(t_allocateTBE, "t", desc="allocate TBE Entry") {
+    if (is_invalid(tbe)) {
+      check_allocate(TBEs);
+      TBEs.allocate(address);
+      set_tbe(TBEs.lookup(address));
+      tbe.Destination.clear();
+      tbe.numAtomics := 0;
+      tbe.atomicDoneCnt := 0;
+    }
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        if(in_msg.Type == CoherenceRequestType:RdBlk || in_msg.Type == CoherenceRequestType:Atomic){
+          tbe.Destination.add(in_msg.Requestor);
+        }
+      }
+    }
+  }
+
+   action(t_allocateTBERemote, "tr", desc="allocate TBE Entry") {
+    if (is_invalid(tbe)) {
+      check_allocate(TBEs);
+      TBEs.allocate(address);
+      set_tbe(TBEs.lookup(address));
+      tbe.Destination.clear();
+      tbe.numAtomics := 0;
+      tbe.atomicDoneCnt := 0;
+    }
+    if (requestToTCC_in.isReady(clockEdge())) {
+      peek(requestToTCC_in, CPURequestMsg) {
+        DPRINTF(CPCoh, "Allocating Remote TLB entry\n");
+        if(in_msg.Type == CoherenceRequestType:RdBlk || in_msg.Type == CoherenceRequestType:Atomic){
+          tbe.Destination.add(in_msg.Requestor);
+          DPRINTF(CPCoh, "Setting Remote flag to be true\n");
+        }
+      }
+    }
+  }
+
+  action(dt_deallocateTBE, "dt", desc="Deallocate TBE entry") {
+    tbe.Destination.clear();
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(wcb_writeCacheBlock, "wcb", desc="write data to TCC") {
+    peek(responseFromNB_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+      DPRINTF(CPCoh, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+  action(wcb_writeCacheBlockRemote, "wcbr", desc="write data to TCC Remote") {
+    peek(responseToTCC_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+      DPRINTF(CPCoh, "Writing to TCC for remote block: %s\n", in_msg);
+    }
+  }
+
+  action(wdb_writeDirtyBytes, "wdb", desc="write data to TCC") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      cache_entry.DataBlk.copyPartial(in_msg.DataBlk,in_msg.writeMask);
+      cache_entry.writeMask.orMask(in_msg.writeMask);
+      if(isHomeNode(machineID, in_msg.homeNode, num_gpus)){
+        cache_entry.homeNode := machineID;
+      }
+      else{
+        DPRINTF(CPCoh, "This is a remote write for address 0x%lx\n", in_msg.addr);
+        cache_entry.homeNode := in_msg.homeNode;
+      }
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+  action(wt_writeThrough, "wt", desc="write back data") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Requestor := machineID;
+        out_msg.WTRequestor := in_msg.Requestor;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceRequestType:WriteThrough;
+        out_msg.Dirty := true;
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.writeMask.orMask(in_msg.writeMask);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(wb_writeBack, "wb", desc="write back data") {
+    if(is_valid(cache_entry) && cache_entry.homeNode == machineID){
+      enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Requestor := machineID;
+        out_msg.WTRequestor := machineID;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceRequestType:WriteThrough;
+        out_msg.Dirty := true;
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.writeMask.orMask(cache_entry.writeMask);
+    }
+    }
+    else{
+        enqueue(requestFromTCC_out, CPURequestMsg, inter_chiplet_request_latency) {
+         out_msg.addr := address;
+          out_msg.Requestor := machineID;
+          out_msg.WTRequestor := machineID;
+          out_msg.Destination.add(cache_entry.homeNode);
+          out_msg.MessageSize := MessageSizeType:Data;
+          out_msg.Type := CoherenceRequestType:WriteThrough;
+          out_msg.Dirty := true;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.writeMask.orMask(cache_entry.writeMask);
+      }
+    }
+  }
+
+  action(wb_writeBackRemote, "wbr", desc="write back data Remote") {
+    peek(requestToTCC_in, CPURequestMsg){
+    enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+      out_msg.addr := address;
+      out_msg.Requestor := machineID;
+      out_msg.WTRequestor := in_msg.WTRequestor;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.MessageSize := MessageSizeType:Data;
+      out_msg.Type := CoherenceRequestType:WriteThrough;
+      out_msg.Dirty := true;
+      DPRINTF(CPCoh, "Home node has recieved a remote Writeback request which it is now sending to directory  for 0x%lx\n", address);
+      out_msg.DataBlk := in_msg.DataBlk;
+      out_msg.writeMask.orMask(in_msg.writeMask);
+    }
+  }
+  }
+
+  action(at_atomicThrough, "at", desc="write back data") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+   if(isHomeNode(machineID, in_msg.homeNode, num_gpus)){
+      enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Requestor := machineID;
+        out_msg.TCCRequestor := machineID;
+        out_msg.WTRequestor := in_msg.Requestor;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        DPRINTF(CPCoh,"Sending a home Atomic request for address 0x%lx with homeNode %d and machID %d\n", address, in_msg.homeNode, machineID );
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceRequestType:Atomic;
+        out_msg.Dirty := true;
+        out_msg.writeMask.orMask(in_msg.writeMask);
+      }
+    }
+    else{  
+        enqueue(requestFromTCC_out, CPURequestMsg, inter_chiplet_request_latency) {
+        out_msg.addr := address;
+        out_msg.Requestor := machineID;
+        out_msg.TCCRequestor := machineID;
+        out_msg.WTRequestor := in_msg.Requestor;
+        out_msg.Destination.add(in_msg.homeNode);
+        DPRINTF(CPCoh,"Sending a home Atomic request for address 0x%lx with homeNode %d and machID %d\n", address, in_msg.homeNode, machineID );
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceRequestType:Atomic;
+        out_msg.Dirty := true;
+        out_msg.writeMask.orMask(in_msg.writeMask);
+      } 
+    }
+  }
+  }
+
+   action(at_atomicThroughRemote, "atr", desc="write back data") {
+    peek(requestToTCC_in, CPURequestMsg) {
+      enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Requestor := machineID;
+        out_msg.TCCRequestor := in_msg.Requestor;
+        out_msg.WTRequestor := in_msg.WTRequestor;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceRequestType:Atomic;
+        DPRINTF(CPCoh, "Home node has recieved a remote atomic request which it is now sending to directory  for 0x%lx\n", address);
+        out_msg.Dirty := true;
+        out_msg.writeMask.orMask(in_msg.writeMask);
+      }
+    }
+  }
+
+  action(pi_sendProbeResponseInv, "pi", desc="send probe ack inv, no data") {
+    enqueue(responseToNB_out, ResponseMsg, 1) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:CPUPrbResp;  // TCC, L3  respond in same way to probes
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.Dirty := false;
+      out_msg.Hit := false;
+      out_msg.Ntsl := true;
+      out_msg.State := CoherenceState:NA;
+      out_msg.MessageSize := MessageSizeType:Response_Control;
+    }
+  }
+  action(ut_updateTag, "ut", desc="update Tag (i.e. set MRU)") {
+    L2cache.setMRU(address);
+  }
+
+  action(p_popRequestQueue, "p", desc="pop request queue") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+    DPRINTF(CPCoh,"Pop request from core queue whose address is 0x%lx\n", in_msg.addr );
+    }
+      coreRequestNetwork_in.dequeue(clockEdge());
+  }
+
+  action(p_popRequestQueueTCC, "pt", desc="pop request queue TCC") {
+    DPRINTF(CPCoh,"Pop request from TCC\n" );
+    requestToTCC_in.dequeue(clockEdge());
+  }
+
+  action(pr_popResponseQueue, "pr", desc="pop response queue") {
+      responseFromNB_in.dequeue(clockEdge());
+  }
+
+  action(pr_popResponseQueueTCC, "prt", desc="pop response queue from TCC") {
+    DPRINTF(CPCoh,"We are done with remote request\n" );
+    responseToTCC_in.dequeue(clockEdge());
+  }
+
+  action(pp_popProbeQueue, "pp", desc="pop probe queue") {
+    probeNetwork_in.dequeue(clockEdge());
+  }
+
+  action(st_stallAndWaitRequestTCC, "stt", desc="Stall and wait on the address") {
+    stall_and_wait(requestToTCC_in, address);
+  }
+
+  action(st_stallAndWaitRequest, "st", desc="Stall and wait on the address") {
+    stall_and_wait(coreRequestNetwork_in, address);
+  }
+
+  action(wada_wakeUpAllDependentsAddr, "wada", desc="Wake up any requests waiting for this address") {
+    wakeUpAllBuffers(address);
+  }
+
+  action(z_stall, "z", desc="stall") {
+      // built-in
+  }
+
+
+  action(ina_incrementNumAtomics, "ina", desc="inc num atomics") {
+    tbe.numAtomics := tbe.numAtomics + 1;
+  }
+
+
+  action(dna_decrementNumAtomics, "dna", desc="inc num atomics") {
+    tbe.numAtomics := tbe.numAtomics - 1;
+    if (tbe.numAtomics==0) {
+      enqueue(triggerQueue_out, TriggerMsg, 1) {
+        tbe.atomicDoneCnt := tbe.atomicDoneCnt + 1;
+        out_msg.addr := address;
+        out_msg.Type := TriggerType:AtomicDone;
+      }
+    }
+  }
+
+  action(dadc_decrementAtomicDoneCnt, "dadc", desc="decrement atomics done cnt flag") {
+    tbe.atomicDoneCnt := tbe.atomicDoneCnt - 1;
+  }
+
+  action(ptr_popTriggerQueue, "ptr", desc="pop Trigger") {
+    triggerQueue_in.dequeue(clockEdge());
+  }
+
+  action(tft_triggerFlushTCC, "tft", desc="after receiving flush from TCP, trigger TCC to flush all dirty addresses"){
+    peek(coreRequestNetwork_in, CPURequestMsg)
+        {
+          coalescer.triggerFlushTCC(in_msg.Requestor);
+        }
+  }
+
+  action(pmq_popMandatoryQueue, "pmq", desc="Pop Mandatory Queue") {
+    mandatoryQueue_in.dequeue(clockEdge());
+  }
+
+  action(tit_triggerInvTCC, "tit", desc="after receiving invalidation from TCP, trigger TCC to invalidate all valid addresses"){
+    if(invalidate_TCC){
+      DPRINTF(RubySlicc, "Starting Invalidation process\n");
+      coalescer.triggerInvTCC();
+    }
+  }
+
+  action(fl_flushDone, "fl", desc="Flush done") {
+    if (!coalescer.isWbComplete())
+    {
+      if (coalescer.flushTCCCallback(address))
+      {
+          enqueue(responseToCore_out, ResponseMsg, l2_response_latency)
+          {
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:FlushWbAck;
+            out_msg.Destination.clear();
+            out_msg.Destination.add(coalescer.getFlushRequestor());
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType : Writeback_Control;
+            //out_msg.instSeqNum := in_msg.instSeqNum;
+          }
+        }
+      }
+  }
+
+  action(inv_invDone, "invi", desc="Inv done") {
+          peek(coreRequestNetwork_in, CPURequestMsg) {
+          enqueue(responseToCore_out, ResponseMsg, l2_response_latency)
+          {
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:InvL2Ack;
+            out_msg.Destination.clear();
+            out_msg.Destination.add(in_msg.Requestor);
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType : Writeback_Control;
+            out_msg.instSeqNum := in_msg.instSeqNum;
+          }
+        }
+    }
+
+action(w_sendResponseWBAckRemote, "wsrb", desc="send WB Ack") {
+    peek(responseFromNB_in, ResponseMsg) {
+        enqueue(responseFromTCC_out, ResponseMsg, inter_chiplet_request_latency ) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.WTRequestor);
+        out_msg.WTRequestor := in_msg.WTRequestor;
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        DPRINTF(CPCoh, "Sending write back Ack to remote node for address 0x%lx\n", address);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+  }
+}
+
+action(m_markpendingRead, "mmpr", desc="Marking a pending Read"){
+    if(is_valid(tbe)){
+      tbe.pendingRead := true;
+    }
+}
+
+//Add Prints
+  // END ACTIONS
+
+  // BEGIN TRANSITIONS
+  // transitions from base
+  // Assumptions for ArrayRead/Write
+  // TBE checked before tags
+  // Data Read/Write requires Tag Read
+
+  // Stalling transitions do NOT check the tag array...and if they do,
+  // they can cause a resource stall deadlock!
+
+  transition(WI, {RdBlk, WrVicBlk, Atomic, WrVicBlkBack}) { //TagArrayRead} {
+      st_stallAndWaitRequest;
+  }
+
+  transition({WV}, {RdBlk, WrVicBlk, Atomic, WrVicBlkBack}) { //TagArrayRead} {
+      z_stall;
+  }
+  transition(A, {RdBlk, WrVicBlk, WrVicBlkBack, Atomic}) { //TagArrayRead} {
+      st_stallAndWaitRequest;
+  }
+  transition(IV, {WrVicBlk, Atomic, WrVicBlkBack}) { //TagArrayRead} {
+      st_stallAndWaitRequest;
+  }
+
+   transition({IV, WV, WI, A}, {RdBlkRemote, WrVicBlkRemote, RdBlkRemoteFull, AtomicRemote, WBRemote}) { //TagArrayRead} {
+      st_stallAndWaitRequestTCC;
+  }
+
+  transition({M, V}, RdBlk) {TagArrayRead, DataArrayRead} {
+    p_profileHit;
+    sd_sendData;
+    ut_updateTag;
+    p_popRequestQueue;
+  }
+
+  transition({M, V}, RdBlkRemote) {TagArrayRead, DataArrayRead} {
+    //p_profileHit;
+    //ans_addNodetoSharerList;
+    sd_sendDataRemote;
+    //ut_updateTag;
+    p_popRequestQueueTCC;
+  }
+
+  transition({M, V, W, I}, AtomicRemote) {TagArrayRead, DataArrayRead} {
+    at_atomicThroughRemote;
+    p_popRequestQueueTCC;
+  }
+
+  transition(W, RdBlkRemoteFull) {TagArrayRead, DataArrayRead} {
+    //p_profileHit;
+    //ans_addNodetoSharerList;
+    sd_sendDataRemote;
+    //ut_updateTag;
+    p_popRequestQueueTCC;
+  }
+
+  transition(W, RdBlkRemote) {TagArrayRead} {
+    //p_profileMiss;
+    //t_allocateTBERemote;
+    //ans_addNodetoSharerList;
+    rd_requestDataRemote;
+    p_popRequestQueueTCC;
+  }
+
+  transition(W, RdBlk, IV) {TagArrayRead, DataArrayRead} {
+    p_profileHit;
+    t_allocateTBE;
+    wb_writeBack;
+    rd_requestData;
+    m_markpendingRead;
+    p_popRequestQueue;
+  }
+
+  transition(W, RdBlkFull) {TagArrayRead, DataArrayRead} {
+    p_profileHit;
+    sd_sendData;
+    ut_updateTag;
+    p_popRequestQueue;
+  }
+
+  transition(I, RdBlk, IV) {TagArrayRead} {
+    p_profileMiss;
+    t_allocateTBE;
+    rd_requestData;
+    p_popRequestQueue;
+  }
+
+   //Note need to check if this is working correctly in requestData
+
+  transition(I, RdBlkRemote) {TagArrayRead} {
+    //p_profileMiss;
+    //t_allocateTBERemote;
+    //ans_addNodetoSharerList;
+    rd_requestDataRemote;
+    p_popRequestQueueTCC;
+  }
+
+  //Note need to check if this is working correctly in requestData
+
+  transition(IV, RdBlk) {
+    p_profileMiss;
+    t_allocateTBE;
+    rd_requestData;
+    p_popRequestQueue;
+  }
+
+  transition(V, Atomic, I) {TagArrayRead} {
+    //p_profileHit;
+    i_invL2;
+    //t_allocateTBE;
+    at_atomicThrough;
+    //ina_incrementNumAtomics;
+    p_popRequestQueue;
+  }
+
+transition(I, Atomic) {TagArrayRead} {
+    //p_profileMiss;
+    i_invL2;
+    //t_allocateTBE;
+    at_atomicThrough;
+    //ina_incrementNumAtomics;
+    p_popRequestQueue;
+  }
+
+  transition({M, W}, Atomic, WI) {TagArrayRead} {
+    p_profileHit;
+    t_allocateTBE;
+    wb_writeBack;
+  }
+
+  transition(I, WrVicBlk) {TagArrayRead} {
+    p_profileMiss;
+    wt_writeThrough;
+    p_popRequestQueue;
+  }
+
+  transition(V, WrVicBlk) {TagArrayRead, DataArrayWrite} {
+    p_profileHit;
+    ut_updateTag;
+    wdb_writeDirtyBytes;
+    wt_writeThrough;
+    p_popRequestQueue;
+  }
+
+  transition({V, M}, WrVicBlkBack, M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    p_profileHit;
+    ut_updateTag;
+    swb_sendWBAck;
+    wdb_writeDirtyBytes;
+    p_popRequestQueue;
+  }
+
+  transition(W, WrVicBlkBack) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    p_profileHit;
+    ut_updateTag;
+    swb_sendWBAck;
+    wdb_writeDirtyBytes;
+    p_popRequestQueue;
+  }
+
+  transition(I, WrVicBlkBack, W) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    p_profileMiss;
+    a_allocateBlock;
+    ut_updateTag;
+    swb_sendWBAck;
+    wdb_writeDirtyBytes;
+    p_popRequestQueue;
+  }
+
+  transition({W, M}, L2_Repl, WI) {TagArrayRead, DataArrayRead} {
+    t_allocateTBE;
+    wb_writeBack;
+    i_invL2;
+  }
+
+  transition({I, V}, L2_Repl, I) {TagArrayRead, TagArrayWrite} {
+    i_invL2;
+  }
+
+  transition({A, IV, WI, WV}, L2_Repl) {
+    i_invL2;
+  }
+
+  transition({I, V}, PrbInv, I) {TagArrayRead, TagArrayWrite} {
+    pi_sendProbeResponseInv;
+    pp_popProbeQueue;
+  }
+
+  transition(M, PrbInv, W) {TagArrayRead, TagArrayWrite} {
+    pi_sendProbeResponseInv;
+    pp_popProbeQueue;
+  }
+
+  transition(W, PrbInv) {TagArrayRead} {
+    pi_sendProbeResponseInv;
+    pp_popProbeQueue;
+  }
+
+  transition({A, IV, WI, WV}, PrbInv) {
+    pi_sendProbeResponseInv;
+    pp_popProbeQueue;
+  }
+
+  transition(IV, Data, V) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    a_allocateBlock;
+    ut_updateTag;
+    wcb_writeCacheBlock;
+    sdr_sendDataResponse;
+    pr_popResponseQueue;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+  }
+
+  transition({I, IV, V, W, M, WI, WV, A}, DataForRemote) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    sdr_sendDataResponse;
+    pr_popResponseQueue;
+  }
+
+  transition({I, IV, V, W, M, WI, WV, A}, AtomicData) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    ar_sendAtomicResponse;
+    pr_popResponseQueue;
+  }
+
+   transition({I, IV, V, W, M, WI, WV, A}, AtomicDataRemote) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    ar_sendAtomicResponseRemote;
+    pr_popResponseQueueTCC;
+  }
+
+   transition(IV, DataRemote, V) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    a_allocateBlock;
+    ut_updateTag;
+    wcb_writeCacheBlockRemote;
+    sdr_sendDataResponseRemote;
+    pr_popResponseQueueTCC;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+  }
+
+
+  transition(A, Data, I) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    //a_allocateBlock;
+    ar_sendAtomicResponse;
+    pr_popResponseQueue;
+    dt_deallocateTBE;
+    wada_wakeUpAllDependentsAddr;
+  }
+
+  transition(A, DataRemote, I) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    //a_allocateBlock;
+    ar_sendAtomicResponseRemote;
+    pr_popResponseQueueTCC;
+    dt_deallocateTBE;
+    wada_wakeUpAllDependentsAddr;
+  }
+
+  transition(A, AtomicDone, I) {TagArrayRead, TagArrayWrite} {
+    dt_deallocateTBE;
+    wada_wakeUpAllDependentsAddr;
+    ptr_popTriggerQueue;
+  }
+
+  transition(A, AtomicNotDone) {TagArrayRead} {
+    dadc_decrementAtomicDoneCnt;
+    ptr_popTriggerQueue;
+  }
+
+  //M,W should not see WBAck as the cache is in WB mode
+  //WBAcks do not need to check tags
+  //TODO:: Same for WBAckFromRemote
+  transition({I, V, IV, A}, WBAck) {
+    w_sendResponseWBAck;
+    pr_popResponseQueue;
+  }
+
+  transition(IV, WBAckFromRemote) {
+    w_sendResponseWBAck;
+    pr_popResponseQueueTCC;
+  }
+
+  transition({I,V,A,M,W}, WBAckFromRemote) {
+    pr_popResponseQueueTCC;
+  }
+
+  transition(WI, WBAck,I) {
+    dt_deallocateTBE;
+    wada_wakeUpAllDependentsAddr;
+    pr_popResponseQueue;
+  }
+
+  transition(WV, WBAck,V) {
+    dt_deallocateTBE;
+    fl_flushDone;
+    wada_wakeUpAllDependentsAddr;
+    pr_popResponseQueue;
+  }
+
+  transition(WI, WBAckFromRemote,I) {
+    dt_deallocateTBE;
+    wada_wakeUpAllDependentsAddr;
+    pr_popResponseQueueTCC;
+  }
+
+  transition(WV, WBAckFromRemote,V) {
+    dt_deallocateTBE;
+    fl_flushDone;
+    //This needs to be edited
+    wada_wakeUpAllDependentsAddr;
+    pr_popResponseQueueTCC;
+  }
+ //Ideally for W you should check if the Write Mask is Full before doing this
+  transition({M, W}, L2Flush, WV) {
+    t_allocateTBE;
+    wb_writeBack;
+    pmq_popMandatoryQueue;
+  }
+
+   transition({I, V}, L2Flush) {
+    fl_flushDone;
+    pmq_popMandatoryQueue;
+  }
+
+  transition({IV, WI}, L2Flush) {
+    z_stall;
+  }
+
+  transition({M, W, V, I, IV, WI, WV}, Flush) {
+    tft_triggerFlushTCC;
+    p_popRequestQueue;
+  }
+
+   transition({M, W , V, I}, WBRemote) {
+    wb_writeBackRemote;
+    p_popRequestQueueTCC;
+  }
+
+  transition({M, W, V, I, IV, WI, WV}, InvCache) {
+    tit_triggerInvTCC;
+    inv_invDone;
+    p_popRequestQueue;
+  }
+
+  transition({M, W, V, I, IV, WI, WV}, WBAckRemote) {
+    w_sendResponseWBAckRemote;
+    pr_popResponseQueue;
+  }
+}
