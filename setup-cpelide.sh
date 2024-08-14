@@ -69,4 +69,4 @@ do
 done
 
 # Square
-docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/square cpelide-artifact bash -c 'make'
+docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/square cpelide-artifact bash -c 'make square_m'
