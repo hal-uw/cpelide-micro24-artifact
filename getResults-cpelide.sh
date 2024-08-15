@@ -6,11 +6,5 @@
 
 # Square
 
-# BFS
-
-# Backprop
-
-# Hotspot3D
-
 # Other benchmarks not included because of runtime for artifact, but concept
 # is same as the above

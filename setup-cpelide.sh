@@ -55,10 +55,9 @@ docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/babelstream cpelid
 
 # Rodinia (BFS, Backprop, BTree, Gaussian, Hotspot3D, Hotspot, LUD, DWT2D, NW, Pathfinder, SRAD_v2)
 #for bench in bfs, backprop, b+tree, gaussian, hotspot3D, hotspot, lud, dwt2d, nw, pathfinder
-for bench in bfs, backprop, hotspot3D
-do
-    docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/$bench cpelide-artifact bash -c 'make'
-done
+#do
+#    docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/$bench cpelide-artifact bash -c 'make'
+#done
 
 # SRAD v2 has an extra level of indirection
 # docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/srad/srad_v2 cpelide-artifact bash -c 'make'
