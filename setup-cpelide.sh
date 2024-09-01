@@ -33,13 +33,13 @@ cd ../..
 # amount of time -- uncomment them if you want the full set
 
 # babelstream
-docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/babelstream cpelide-artifact bash -c 'make'
+docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/babelstream cpelide-artifact bash -c 'make'
 
 # DeepBench (RNNs)
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/DeepBench/code/amd cpelide-artifact bash -c 'make'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/DeepBench/code/amd cpelide-artifact bash -c 'make'
 
 # gemm
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/gemm cpelide-artifact bash -c 'make'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/gemm cpelide-artifact bash -c 'make'
 
 # HACC
 # Note: HACC requires setting numerous environment variables to run correctly.  To
@@ -49,22 +49,22 @@ docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/babelstream cpelid
 # docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/halo-finder/src hacc-test bash -c 'make hip/ForceTreeTest'
 
 # LULESH
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/lulesh cpelide-artifact bash -c 'make'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/lulesh cpelide-artifact bash -c 'make'
 
 # Pannotia -- compile all in a single command
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/pannotia cpelide-artifact bash -c 'bash ./buildall.sh gem5-fusion'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/pannotia cpelide-artifact bash -c 'bash ./buildall.sh gem5-fusion'
 
 # Pennant
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/pennant cpelide-artifact bash -c 'make'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/pennant cpelide-artifact bash -c 'make'
 
 # Rodinia (BFS, Backprop, BTree, Gaussian, Hotspot3D, Hotspot, LUD, DWT2D, NW, Pathfinder, SRAD_v2)
 #for bench in bfs, backprop, b+tree, gaussian, hotspot3D, hotspot, lud, dwt2d, nw, pathfinder
 #do
-#    docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/$bench cpelide-artifact bash -c 'make'
+#    docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/$bench cpelide-artifact bash -c 'make'
 #done
 
 # SRAD v2 has an extra level of indirection
-# docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/srad/srad_v2 cpelide-artifact bash -c 'make'
+# docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/rodinia/srad/srad_v2 cpelide-artifact bash -c 'make'
 
 # Square
-docker run -rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/square cpelide-artifact bash -c 'make square_m'
+docker run --rm -v $(pwd):$(pwd) -w $(pwd)/multigpu_benchmarks/square cpelide-artifact bash -c 'make square_m'
