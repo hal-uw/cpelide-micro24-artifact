@@ -7,6 +7,8 @@
 
 # Step 0: set path
 export GEM5_PATH=${PWD} # benchmarks need this path to be set
+# clone benchmarks subrepo in properly
+git submodule update --init
 
 # Step 1: setup docker image -- this will take 30-45 minutes
 cd gem5_multigpu/multigpu_benchmarks
