@@ -7,6 +7,8 @@
 
 # Step 0: set path
 export GEM5_PATH=${PWD} # benchmarks need this path to be set
+# some systems require Docker to be initialized first
+systemctl --user start docker.service
 # clone benchmarks subrepo in properly
 git submodule update --init
 
