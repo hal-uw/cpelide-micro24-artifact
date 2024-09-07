@@ -24,9 +24,9 @@ cd ../ # goes back to gem5_multgpu folder
 #docker run --rm -v ${PWD}:${PWD} -w ${PWD} cpelide-artifact scons -sQ -j$(nproc) build/GCN3_X86/gem5.opt
 docker run --rm -v ${PWD}:${PWD} -w ${PWD} cpelide-artifact scons -j$(nproc) build/GCN3_X86/gem5.opt
 # build m5ops that benchmarks use for annotations
-cd util/m5
-docker run --rm -v ${PWD}:${PWD} -w ${PWD} cpelide-artifact scons build/x86/out/m5
-cd ../..
+# Note: setting TERM in the environment is necessary as scons fails for m5ops if
+# it is not set.
+docker run --rm -v $(pwd):$(pwd) -w $(pwd)/util/m5 cpelide-artifact bash -c "export TERM=xterm-256color ; scons build/x86/out/m5"
 
 # Step 3: build benchmarks (datasets already grabbed from clone)
 # Note: some benchmarks are commented out to have this complete in a reasonable
